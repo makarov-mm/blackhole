@@ -26,6 +26,10 @@ far side of the disk folded into view by gravity.
 - **Relativistic effects on the disk:** Doppler beaming and blue/redshift from
   the orbital motion (the side rotating toward you is brighter and bluer — the
   signature asymmetry) plus gravitational redshift dimming near the horizon.
+- **Relativistic polar jets.** Two optically-thin synchrotron-emitting conical
+  outflows are integrated volumetrically along the same bent photon path. The
+  approaching jet is Doppler-boosted, the counter-jet is dimmed, and both are
+  gravitationally redshifted near the hole.
 - **One pass, no geometry.** The whole image is a single fullscreen triangle; the
   fragment shader does all the work. No meshes, no textures, no math crate.
 
@@ -79,6 +83,47 @@ relativistic Doppler factor `δ = 1 / (γ(1 − β·μ))` with beaming `∝ δ³
 size is adaptive — small near the hole where the path curves hard, larger far
 away.
 
+## Relativistic jet model
+
+The polar jets are deliberately more than a decorative overlay. They are sampled
+inside the ray-march loop, so the same Schwarzschild geodesic that bends the
+disk and background also passes through the jet volume. This means the apparent
+shape changes naturally with camera angle and lensing near the hole.
+
+The model is still a compact real-time approximation, not a full GRMHD
+simulation. The assumptions are explicit:
+
+- the black hole is kept Schwarzschild (`r_s = 1`), so the jet axis is imposed as
+  a fixed visual spin axis rather than derived from a Kerr metric;
+- each jet is a transparent cone along `+Y` / `-Y`, launched just outside the
+  horizon and fading with height;
+- the plasma has a spine/sheath density profile plus procedural knots and shock
+  bands to avoid a sterile smooth cone;
+- the bulk flow moves outward with `β = v/c`, accelerating from about `0.55c`
+  near the base to about `0.94c` farther out;
+- observed emission uses the same Doppler factor form
+  `δ = 1 / (γ(1 − β μ))`, where `μ` is the cosine between the local outflow
+  direction and the direction to the camera;
+- synchrotron-like optically-thin intensity is boosted approximately as
+  `δ^(3+α)` with spectral index `α ≈ 0.65`;
+- gravitational redshift is approximated by `g_grav = √(1 − r_s/r)`, so emission
+  from the compact base is dimmed and reddened;
+- the final colour shift uses `g = g_grav · δ`, so the approaching jet becomes
+  brighter/bluer and the receding jet becomes dimmer/redder.
+
+In code this lives in `jetSample()` in `src/render.rs` and `jet_sample()` in
+`src/blackhole.rs`. During each ray step the renderer adds a small amount of
+jet emission and opacity before advancing the photon. The jets are mostly
+transparent; opacity is only used to give the dense base some self-occlusion and
+to stop infinite accumulation.
+
+Important limitation: because the spacetime is Schwarzschild, this does not
+model frame dragging, black-hole spin, Blandford-Znajek launching, magnetic
+fields, polarization, or real radiative transfer. A physically deeper version
+would need a Kerr geodesic integrator plus GRMHD-derived density, velocity and
+magnetic-field data. This implementation is a visually serious relativistic
+jet approximation that fits the current single-pass real-time renderer.
+
 ## Verification
 
 The renderer's core is validated headless (`src/blackhole.rs` + `src/bin/verify.rs`),
@@ -99,9 +144,12 @@ validated Rust in `src/blackhole.rs`.
 ## Tuning
 
 In `src/blackhole.rs` / the shader: `DISK_IN` / `DISK_OUT` (disk extent),
-the temperature colours, the `1.4` emission gain, and the Doppler `β` cap. In
-`src/camera.rs`: starting distance and field of view. Camera pitch near the disk
-plane gives the most dramatic lensing.
+the temperature colours, the `1.4` disk emission gain, and the Doppler `β` cap.
+For jets, tune the cone opening angle, launch/fade heights, terminal `β`,
+spectral index `alphaSpec`, emission gain `0.105`, and optical-depth scale
+`0.040`. In `src/camera.rs`: starting distance and field of view. Camera pitch
+near the disk plane gives the most dramatic lensing; elevated angles show the
+jet/counter-jet asymmetry more clearly.
 
 ## Layout
 
