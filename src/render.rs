@@ -96,60 +96,110 @@ vec4 diskSample(vec3 hit, vec3 eye, float time) {
     vec3 col = mix(inner, midc, smoothstep(0.0, 0.45, t));
     col = mix(col, outer, smoothstep(0.45, 1.0, t));
 
+    // Schwarzschild gravitational redshift for a static emitter at radius r.
     float grav = sqrt(max(1.0 - RS / r, 0.0));
 
+    // Keplerian disk motion in Schwarzschild units. With r_s = 1, M = 0.5.
+    // The local orbital speed measured by a stationary observer is roughly
+    // beta = sqrt(M / (r - r_s)), which is stronger than the Newtonian estimate
+    // near the ISCO and produces the expected bright/bluish approaching side.
     vec3 radial = normalize(vec3(hit.x, 0.0, hit.z));
     vec3 orbDir = normalize(cross(vec3(0.0, 1.0, 0.0), radial));
-    float beta = clamp(sqrt(0.5 / r), 0.0, 0.85);
-    float gamma = 1.0 / sqrt(1.0 - beta * beta);
+    float beta = clamp(sqrt(0.5 / max(r - RS, 0.05)), 0.0, 0.86);
+    float gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1e-5));
     vec3 toCam = normalize(eye - hit);
     float mu = dot(orbDir, toCam);
     float doppler = 1.0 / (gamma * (1.0 - beta * mu));
 
-    float beaming = pow(doppler, 3.0);
-    float sh = clamp(doppler, 0.55, 1.9);
-    vec3 shift = vec3(1.0 / sh, 1.0, sh);
+    // Combined observed frequency shift g = nu_obs / nu_emit.  The bolometric
+    // thermal brightness of the disk is approximated as g^4, while the colour
+    // is shifted by the same factor.  Clamps keep the realtime visual stable.
+    float g = clamp(grav * doppler, 0.24, 2.05);
+    float beaming = pow(g, 4.2);
+    vec3 shift = vec3(1.0 / pow(max(g, 0.55), 0.85), 1.0, pow(g, 0.85));
 
-    vec3 emit = col * shift * (density * grav * beaming * 1.4);
-    float alpha = clamp(density * 1.6, 0.0, 1.0) * 0.92;
+    vec3 emit = col * shift * (density * beaming * 1.38);
+    float alpha = clamp(density * 1.18, 0.0, 1.0) * 0.76;
     return vec4(emit, alpha);
 }
 
 
+// Finite-thickness accretion flow, sampled volumetrically along the bent ray.
+// The old equatorial crossing remains as a thin luminous mid-plane; this layer
+// adds thickness, self-absorption and softer lensed upper/lower disk edges.
+vec4 diskVolumeSample(vec3 p, vec3 eye, float time, float ds) {
+    float rc = length(p.xz);
+    if (rc < DISK_IN || rc > DISK_OUT) return vec4(0.0);
+
+    float t = (rc - DISK_IN) / (DISK_OUT - DISK_IN);
+    float H = 0.040 + 0.018 * rc;                 // thinner scale height; avoids a washed-out blob
+    float y = abs(p.y);
+    if (y > H * 3.0) return vec4(0.0);
+
+    float vertical = exp(-(y * y) / max(H * H, 1e-4));
+    float ang = atan(p.z, p.x);
+    float omega = pow(rc, -1.5);
+    float swirl = ang * 2.0 - time * omega * 2.4;
+
+    float bands = 0.5 + 0.5 * sin(swirl * 3.0 + p.y * 2.0);
+    float n = fbm2(swirl * 1.8 + 10.0, rc * 0.8 + p.y * 1.7);
+    float density = vertical * (0.30 + 0.70 * n) * mix(bands, 1.0, 0.55);
+    density *= pow(1.0 - smoothstep(0.0, 1.0, t), 0.75) + 0.05;
+    density *= smoothstep(0.0, 0.10, t) * (1.0 - smoothstep(0.86, 1.0, t));
+
+    vec3 inner = vec3(0.78, 0.90, 1.15);
+    vec3 midc  = vec3(1.0, 0.82, 0.48);
+    vec3 outer = vec3(0.95, 0.34, 0.12);
+    vec3 col = mix(inner, midc, smoothstep(0.0, 0.45, t));
+    col = mix(col, outer, smoothstep(0.45, 1.0, t));
+
+    float r = length(p);
+    float grav = sqrt(max(1.0 - RS / r, 0.0));
+    vec3 radial = normalize(vec3(p.x, 0.0, p.z));
+    vec3 orbDir = normalize(cross(vec3(0.0, 1.0, 0.0), radial));
+    float beta = clamp(sqrt(0.5 / max(rc - RS, 0.05)), 0.0, 0.86);
+    float gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1e-5));
+    vec3 toCam = normalize(eye - p);
+    float mu = dot(orbDir, toCam);
+    float doppler = 1.0 / (gamma * (1.0 - beta * mu));
+    float g = clamp(grav * doppler, 0.18, 2.75);
+    float beaming = pow(g, 4.2);                 // visible but not overexposed
+    vec3 shift = vec3(1.0 / pow(max(g, 0.55), 0.85), 1.0, pow(g, 0.85));
+
+    vec3 emit = col * shift * density * beaming * ds * 0.34;
+    float tau = density * ds * 0.105;
+    float alpha = clamp(1.0 - exp(-tau), 0.0, 0.070);
+    return vec4(emit, alpha);
+}
+
 // Relativistic optically-thin polar jet emission, sampled volumetrically along
-// the already-lensed null geodesic. This is not just a billboard: the plasma is
-// tied to the black-hole frame, the ray bends through it, and the observed
-// intensity is boosted by gravitational redshift and special-relativistic
-// Doppler beaming from outward bulk flow.
+// the same lensed null geodesic as the disk and background.
 vec4 jetSample(vec3 p, vec3 eye, float time, float ds) {
     float h = abs(p.y);
     float rho = length(p.xz);
-    if (h < 1.35 || h > 28.0) return vec4(0.0);
+    if (h < 1.25 || h > 30.0) return vec4(0.0);
 
-    float opening = tan(radians(7.5));
-    float radius = 0.16 + opening * h;
+    float opening = tan(radians(5.5));
+    float radius = 0.10 + opening * h;
     float q = rho / radius;
-    if (q > 1.65) return vec4(0.0);
+    if (q > 1.75) return vec4(0.0);
 
     float r = length(p);
-    float launch = smoothstep(1.35, 2.4, h);
-    float fade = exp(-h / 17.0);
-    float core = exp(-q * q * 3.2);
-    float sheath = exp(-pow((q - 0.86) / 0.33, 2.0)) * 0.55;
+    float launch = smoothstep(1.05, 1.85, h);
+    float fade = exp(-h / 22.0);
+    float core = exp(-q * q * 3.4);
+    float sheath = exp(-pow((q - 0.88) / 0.34, 2.0)) * 0.60;
 
     float phi = atan(p.z, p.x);
-    float twist = phi * 3.0 + h * 0.85 - time * 1.7 * sign(p.y);
-    float knots = 0.45 + 0.55 * fbm2(twist, h * 0.42 - time * 0.55);
+    float twist = phi * 3.0 + h * 0.82 - time * 1.6 * sign(p.y);
+    float knots = 0.40 + 0.60 * fbm2(twist, h * 0.42 - time * 0.55);
     float shock = pow(0.5 + 0.5 * sin(h * 2.1 - time * 3.5 + phi * 2.0), 5.0);
-    float density = launch * fade * (core + sheath) * (0.58 + 0.42 * knots) * (0.75 + 0.55 * shock);
+    float density = launch * fade * (core + sheath) * (0.55 + 0.45 * knots) * (0.78 + 0.60 * shock);
 
     vec3 axis = vec3(0.0, sign(p.y), 0.0);
     vec3 radial = normalize(vec3(p.x, 0.0, p.z) + vec3(1e-4, 0.0, 0.0));
     vec3 flowDir = normalize(axis * 0.94 + radial * opening * 0.55);
-
-    // Mild acceleration: compact base is slower, far spine approaches a high
-    // Lorentz factor. beta is v/c.
-    float beta = mix(0.55, 0.94, smoothstep(1.4, 10.0, h));
+    float beta = mix(0.55, 0.94, smoothstep(1.35, 10.0, h));
     float gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1e-5));
     vec3 toCam = normalize(eye - p);
     float mu = dot(flowDir, toCam);
@@ -157,20 +207,12 @@ vec4 jetSample(vec3 p, vec3 eye, float time, float ds) {
 
     float grav = sqrt(max(1.0 - RS / r, 0.0));
     float g = clamp(grav * doppler, 0.05, 5.0);
+    float beaming = pow(doppler, 3.65);
 
-    // Synchrotron-like optically thin emission: I_nu approximately transforms
-    // as delta^(3+alpha). alpha ~ 0.65 is typical enough for a visual model.
-    float alphaSpec = 0.65;
-    float beaming = pow(doppler, 3.0 + alphaSpec);
-
-    vec3 base = mix(vec3(0.30, 0.55, 1.45), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
+    vec3 base = mix(vec3(0.24, 0.52, 1.55), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
     vec3 shifted = base * vec3(1.0 / max(g, 0.35), 1.0, g);
-    vec3 emit = shifted * density * grav * beaming * ds * 0.105;
-
-    // Jets are almost transparent; opacity only prevents unlimited overdraw in
-    // the dense base and helps the nearer jet occlude the counter-jet slightly.
-    float opticalDepth = density * ds * 0.040;
-    float alpha = clamp(1.0 - exp(-opticalDepth), 0.0, 0.18);
+    vec3 emit = shifted * density * grav * beaming * ds * 0.72;
+    float alpha = clamp(1.0 - exp(-density * ds * 0.115), 0.0, 0.26);
     return vec4(emit, alpha);
 }
 
@@ -188,6 +230,11 @@ vec3 trace(vec3 eye, vec3 dir, float time) {
         if (r > ESCAPE) { col += background(v) * transmittance; return col; }
 
         float dt = clamp(r * 0.09, 0.012, 0.5);
+
+        vec4 vds = diskVolumeSample(p, eye, time, dt);
+        col += vds.rgb * transmittance;
+        transmittance *= 1.0 - vds.a;
+
         vec4 js = jetSample(p, eye, time, dt);
         col += js.rgb * transmittance;
         transmittance *= 1.0 - js.a;

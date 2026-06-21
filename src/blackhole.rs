@@ -129,65 +129,114 @@ fn disk_sample(hit: Vec3, eye: Vec3, time: f32) -> (Vec3, f32) {
     let mut col = mix3(inner, midc, smoothstep(0.0, 0.45, t));
     col = mix3(col, outer, smoothstep(0.45, 1.0, t));
 
-    // gravitational redshift (dims & reddens near the hole)
+    // Schwarzschild gravitational redshift for a static emitter at radius r.
     let grav = (1.0 - RS / r).max(0.0).sqrt();
 
-    // relativistic Doppler from Keplerian orbital motion
+    // Keplerian disk motion in Schwarzschild units. With r_s = 1, M = 0.5.
+    // The local orbital speed measured by a stationary observer is approximated
+    // as beta = sqrt(M / (r - r_s)); this is deliberately stronger than the
+    // Newtonian estimate near the ISCO and gives the expected asymmetric disk.
     let radial = vec3(hit.x, 0.0, hit.z).normalized();
-    let orb_dir = vec3(0.0, 1.0, 0.0).cross(radial).normalized(); // rotation direction
-    let beta = clamp((0.5 / r).sqrt(), 0.0, 0.85); // v in units of c  (M = 0.5)
-    let gamma = 1.0 / (1.0 - beta * beta).sqrt();
+    let orb_dir = vec3(0.0, 1.0, 0.0).cross(radial).normalized();
+    let beta = clamp((0.5 / (r - RS).max(0.05)).sqrt(), 0.0, 0.86);
+    let gamma = 1.0 / (1.0 - beta * beta).max(1e-5).sqrt();
     let to_cam = (eye - hit).normalized();
     let mu = orb_dir.dot(to_cam);
-    let doppler = 1.0 / (gamma * (1.0 - beta * mu)); // relativistic factor delta
+    let doppler = 1.0 / (gamma * (1.0 - beta * mu));
 
-    // beaming: approaching side much brighter
-    let beaming = doppler.powi(3);
-    // colour shift: approaching -> bluer, receding -> redder
-    let sh = clamp(doppler, 0.55, 1.9);
-    let shift = vec3(1.0 / sh, 1.0, sh);
+    // Combined observed frequency shift g = nu_obs / nu_emit.  The bolometric
+    // thermal brightness of the disk is approximated as g^4, while the colour
+    // is shifted by the same factor.  Clamps keep the realtime visual stable.
+    let g = clamp(grav * doppler, 0.24, 2.05);
+    let beaming = g.powf(4.2);
+    let shift = vec3(1.0 / g.max(0.55).powf(0.85), 1.0, g.powf(0.85));
 
-    let emit = col * shift * (density * grav * beaming * 1.4);
-    let alpha = clamp(density * 1.6, 0.0, 1.0) * 0.92;
+    let emit = col * shift * (density * beaming * 1.38);
+    let alpha = clamp(density * 1.18, 0.0, 1.0) * 0.76;
     (emit, alpha)
 }
 
 
-/// Relativistic optically-thin polar jet emission sampled along the lensed ray.
-/// The jet is represented as two conical synchrotron-emitting outflows attached
-/// to the black-hole spin axis. Plasma moves outward with beta=v/c, so observed
-/// intensity is transformed by Doppler beaming and gravitational redshift.
-fn jet_sample(p: Vec3, eye: Vec3, time: f32, ds: f32) -> (Vec3, f32) {
-    let h = p.y.abs();
-    let rho = (p.x * p.x + p.z * p.z).sqrt();
-    if h < 1.35 || h > 28.0 {
+/// Finite-thickness volumetric disk sampled along the ray.
+fn disk_volume_sample(p: Vec3, eye: Vec3, time: f32, ds: f32) -> (Vec3, f32) {
+    let rc = (p.x * p.x + p.z * p.z).sqrt();
+    if rc < DISK_IN || rc > DISK_OUT {
+        return (Vec3::default(), 0.0);
+    }
+    let t = (rc - DISK_IN) / (DISK_OUT - DISK_IN);
+    let h_scale = 0.040 + 0.018 * rc;
+    let y = p.y.abs();
+    if y > h_scale * 3.0 {
         return (Vec3::default(), 0.0);
     }
 
-    let opening = 7.5_f32.to_radians().tan();
-    let radius = 0.16 + opening * h;
+    let vertical = (-(y * y) / (h_scale * h_scale).max(1e-4)).exp();
+    let ang = p.z.atan2(p.x);
+    let omega = rc.powf(-1.5);
+    let swirl = ang * 2.0 - time * omega * 2.4;
+
+    let bands = 0.5 + 0.5 * (swirl * 3.0 + p.y * 2.0).sin();
+    let n = fbm2(swirl * 1.8 + 10.0, rc * 0.8 + p.y * 1.7);
+    let mut density = vertical * (0.30 + 0.70 * n) * mix(bands, 1.0, 0.55);
+    density *= (1.0 - smoothstep(0.0, 1.0, t)).powf(0.75) + 0.05;
+    density *= smoothstep(0.0, 0.10, t) * (1.0 - smoothstep(0.86, 1.0, t));
+
+    let inner = vec3(0.78, 0.90, 1.15);
+    let midc = vec3(1.0, 0.82, 0.48);
+    let outer = vec3(0.95, 0.34, 0.12);
+    let mut col = mix3(inner, midc, smoothstep(0.0, 0.45, t));
+    col = mix3(col, outer, smoothstep(0.45, 1.0, t));
+
+    let r = p.length();
+    let grav = (1.0 - RS / r).max(0.0).sqrt();
+    let radial = vec3(p.x, 0.0, p.z).normalized();
+    let orb_dir = vec3(0.0, 1.0, 0.0).cross(radial).normalized();
+    let beta = clamp((0.5 / (rc - RS).max(0.05)).sqrt(), 0.0, 0.86);
+    let gamma = 1.0 / (1.0 - beta * beta).max(1e-5).sqrt();
+    let to_cam = (eye - p).normalized();
+    let mu = orb_dir.dot(to_cam);
+    let doppler = 1.0 / (gamma * (1.0 - beta * mu));
+    let g = clamp(grav * doppler, 0.18, 2.75);
+    let beaming = g.powf(4.2);
+    let shift = vec3(1.0 / g.max(0.55).powf(0.85), 1.0, g.powf(0.85));
+
+    let emit = col * shift * (density * beaming * ds * 0.34);
+    let tau = density * ds * 0.105;
+    let alpha = clamp(1.0 - (-tau).exp(), 0.0, 0.070);
+    (emit, alpha)
+}
+
+/// Relativistic optically-thin polar jet emission sampled volumetrically.
+fn jet_sample(p: Vec3, eye: Vec3, time: f32, ds: f32) -> (Vec3, f32) {
+    let h = p.y.abs();
+    let rho = (p.x * p.x + p.z * p.z).sqrt();
+    if h < 1.25 || h > 30.0 {
+        return (Vec3::default(), 0.0);
+    }
+
+    let opening = 5.5_f32.to_radians().tan();
+    let radius = 0.10 + opening * h;
     let q = rho / radius;
-    if q > 1.65 {
+    if q > 1.75 {
         return (Vec3::default(), 0.0);
     }
 
     let r = p.length();
-    let launch = smoothstep(1.35, 2.4, h);
-    let fade = (-h / 17.0).exp();
-    let core = (-(q * q) * 3.2).exp();
-    let sheath = (-((q - 0.86) / 0.33).powi(2)).exp() * 0.55;
+    let launch = smoothstep(1.05, 1.85, h);
+    let fade = (-h / 22.0).exp();
+    let core = (-(q * q) * 3.4).exp();
+    let sheath = (-((q - 0.88) / 0.34).powi(2)).exp() * 0.60;
 
     let phi = p.z.atan2(p.x);
-    let twist = phi * 3.0 + h * 0.85 - time * 1.7 * p.y.signum();
-    let knots = 0.45 + 0.55 * fbm2(twist, h * 0.42 - time * 0.55);
+    let twist = phi * 3.0 + h * 0.82 - time * 1.6 * p.y.signum();
+    let knots = 0.40 + 0.60 * fbm2(twist, h * 0.42 - time * 0.55);
     let shock = (0.5 + 0.5 * (h * 2.1 - time * 3.5 + phi * 2.0).sin()).powf(5.0);
-    let density = launch * fade * (core + sheath) * (0.58 + 0.42 * knots) * (0.75 + 0.55 * shock);
+    let density = launch * fade * (core + sheath) * (0.55 + 0.45 * knots) * (0.78 + 0.60 * shock);
 
     let axis = vec3(0.0, p.y.signum(), 0.0);
     let radial = vec3(p.x + 1e-4, 0.0, p.z).normalized();
     let flow_dir = (axis * 0.94 + radial * opening * 0.55).normalized();
-
-    let beta = mix(0.55, 0.94, smoothstep(1.4, 10.0, h));
+    let beta = mix(0.55, 0.94, smoothstep(1.35, 10.0, h));
     let gamma = 1.0 / (1.0 - beta * beta).max(1e-5).sqrt();
     let to_cam = (eye - p).normalized();
     let mu = flow_dir.dot(to_cam);
@@ -195,15 +244,12 @@ fn jet_sample(p: Vec3, eye: Vec3, time: f32, ds: f32) -> (Vec3, f32) {
 
     let grav = (1.0 - RS / r).max(0.0).sqrt();
     let g = clamp(grav * doppler, 0.05, 5.0);
-    let alpha_spec = 0.65;
-    let beaming = doppler.powf(3.0 + alpha_spec);
+    let beaming = doppler.powf(3.65);
 
-    let base = mix3(vec3(0.30, 0.55, 1.45), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
+    let base = mix3(vec3(0.24, 0.52, 1.55), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
     let shifted = base * vec3(1.0 / g.max(0.35), 1.0, g);
-    let emit = shifted * (density * grav * beaming * ds * 0.105);
-
-    let optical_depth = density * ds * 0.040;
-    let alpha = clamp(1.0 - (-optical_depth).exp(), 0.0, 0.18);
+    let emit = shifted * (density * grav * beaming * ds * 0.72);
+    let alpha = clamp(1.0 - (-(density * ds * 0.115)).exp(), 0.0, 0.26);
     (emit, alpha)
 }
 
@@ -228,6 +274,10 @@ pub fn trace(eye: Vec3, dir: Vec3, time: f32) -> Vec3 {
         }
 
         let dt = clamp(r * 0.09, 0.012, 0.5);
+
+        let (vol_emit, vol_alpha) = disk_volume_sample(p, eye, time, dt);
+        col += vol_emit * transmittance;
+        transmittance *= 1.0 - vol_alpha;
 
         let (jet_emit, jet_alpha) = jet_sample(p, eye, time, dt);
         col += jet_emit * transmittance;
