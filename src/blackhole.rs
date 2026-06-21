@@ -152,6 +152,61 @@ fn disk_sample(hit: Vec3, eye: Vec3, time: f32) -> (Vec3, f32) {
     (emit, alpha)
 }
 
+
+/// Relativistic optically-thin polar jet emission sampled along the lensed ray.
+/// The jet is represented as two conical synchrotron-emitting outflows attached
+/// to the black-hole spin axis. Plasma moves outward with beta=v/c, so observed
+/// intensity is transformed by Doppler beaming and gravitational redshift.
+fn jet_sample(p: Vec3, eye: Vec3, time: f32, ds: f32) -> (Vec3, f32) {
+    let h = p.y.abs();
+    let rho = (p.x * p.x + p.z * p.z).sqrt();
+    if h < 1.35 || h > 28.0 {
+        return (Vec3::default(), 0.0);
+    }
+
+    let opening = 7.5_f32.to_radians().tan();
+    let radius = 0.16 + opening * h;
+    let q = rho / radius;
+    if q > 1.65 {
+        return (Vec3::default(), 0.0);
+    }
+
+    let r = p.length();
+    let launch = smoothstep(1.35, 2.4, h);
+    let fade = (-h / 17.0).exp();
+    let core = (-(q * q) * 3.2).exp();
+    let sheath = (-((q - 0.86) / 0.33).powi(2)).exp() * 0.55;
+
+    let phi = p.z.atan2(p.x);
+    let twist = phi * 3.0 + h * 0.85 - time * 1.7 * p.y.signum();
+    let knots = 0.45 + 0.55 * fbm2(twist, h * 0.42 - time * 0.55);
+    let shock = (0.5 + 0.5 * (h * 2.1 - time * 3.5 + phi * 2.0).sin()).powf(5.0);
+    let density = launch * fade * (core + sheath) * (0.58 + 0.42 * knots) * (0.75 + 0.55 * shock);
+
+    let axis = vec3(0.0, p.y.signum(), 0.0);
+    let radial = vec3(p.x + 1e-4, 0.0, p.z).normalized();
+    let flow_dir = (axis * 0.94 + radial * opening * 0.55).normalized();
+
+    let beta = mix(0.55, 0.94, smoothstep(1.4, 10.0, h));
+    let gamma = 1.0 / (1.0 - beta * beta).max(1e-5).sqrt();
+    let to_cam = (eye - p).normalized();
+    let mu = flow_dir.dot(to_cam);
+    let doppler = 1.0 / (gamma * (1.0 - beta * mu));
+
+    let grav = (1.0 - RS / r).max(0.0).sqrt();
+    let g = clamp(grav * doppler, 0.05, 5.0);
+    let alpha_spec = 0.65;
+    let beaming = doppler.powf(3.0 + alpha_spec);
+
+    let base = mix3(vec3(0.30, 0.55, 1.45), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
+    let shifted = base * vec3(1.0 / g.max(0.35), 1.0, g);
+    let emit = shifted * (density * grav * beaming * ds * 0.105);
+
+    let optical_depth = density * ds * 0.040;
+    let alpha = clamp(1.0 - (-optical_depth).exp(), 0.0, 0.18);
+    (emit, alpha)
+}
+
 /// Trace one photon backwards from the eye. Returns linear RGB.
 pub fn trace(eye: Vec3, dir: Vec3, time: f32) -> Vec3 {
     let mut p = eye;
@@ -173,6 +228,14 @@ pub fn trace(eye: Vec3, dir: Vec3, time: f32) -> Vec3 {
         }
 
         let dt = clamp(r * 0.09, 0.012, 0.5);
+
+        let (jet_emit, jet_alpha) = jet_sample(p, eye, time, dt);
+        col += jet_emit * transmittance;
+        transmittance *= 1.0 - jet_alpha;
+        if transmittance < 0.02 {
+            return col;
+        }
+
         let acc = p * (-1.5 * h2 / r.powi(5));
         let prev = p;
         v += acc * dt;

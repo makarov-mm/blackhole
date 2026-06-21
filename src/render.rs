@@ -115,6 +115,65 @@ vec4 diskSample(vec3 hit, vec3 eye, float time) {
     return vec4(emit, alpha);
 }
 
+
+// Relativistic optically-thin polar jet emission, sampled volumetrically along
+// the already-lensed null geodesic. This is not just a billboard: the plasma is
+// tied to the black-hole frame, the ray bends through it, and the observed
+// intensity is boosted by gravitational redshift and special-relativistic
+// Doppler beaming from outward bulk flow.
+vec4 jetSample(vec3 p, vec3 eye, float time, float ds) {
+    float h = abs(p.y);
+    float rho = length(p.xz);
+    if (h < 1.35 || h > 28.0) return vec4(0.0);
+
+    float opening = tan(radians(7.5));
+    float radius = 0.16 + opening * h;
+    float q = rho / radius;
+    if (q > 1.65) return vec4(0.0);
+
+    float r = length(p);
+    float launch = smoothstep(1.35, 2.4, h);
+    float fade = exp(-h / 17.0);
+    float core = exp(-q * q * 3.2);
+    float sheath = exp(-pow((q - 0.86) / 0.33, 2.0)) * 0.55;
+
+    float phi = atan(p.z, p.x);
+    float twist = phi * 3.0 + h * 0.85 - time * 1.7 * sign(p.y);
+    float knots = 0.45 + 0.55 * fbm2(twist, h * 0.42 - time * 0.55);
+    float shock = pow(0.5 + 0.5 * sin(h * 2.1 - time * 3.5 + phi * 2.0), 5.0);
+    float density = launch * fade * (core + sheath) * (0.58 + 0.42 * knots) * (0.75 + 0.55 * shock);
+
+    vec3 axis = vec3(0.0, sign(p.y), 0.0);
+    vec3 radial = normalize(vec3(p.x, 0.0, p.z) + vec3(1e-4, 0.0, 0.0));
+    vec3 flowDir = normalize(axis * 0.94 + radial * opening * 0.55);
+
+    // Mild acceleration: compact base is slower, far spine approaches a high
+    // Lorentz factor. beta is v/c.
+    float beta = mix(0.55, 0.94, smoothstep(1.4, 10.0, h));
+    float gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1e-5));
+    vec3 toCam = normalize(eye - p);
+    float mu = dot(flowDir, toCam);
+    float doppler = 1.0 / (gamma * (1.0 - beta * mu));
+
+    float grav = sqrt(max(1.0 - RS / r, 0.0));
+    float g = clamp(grav * doppler, 0.05, 5.0);
+
+    // Synchrotron-like optically thin emission: I_nu approximately transforms
+    // as delta^(3+alpha). alpha ~ 0.65 is typical enough for a visual model.
+    float alphaSpec = 0.65;
+    float beaming = pow(doppler, 3.0 + alphaSpec);
+
+    vec3 base = mix(vec3(0.30, 0.55, 1.45), vec3(0.90, 1.05, 1.35), smoothstep(0.0, 1.4, q));
+    vec3 shifted = base * vec3(1.0 / max(g, 0.35), 1.0, g);
+    vec3 emit = shifted * density * grav * beaming * ds * 0.105;
+
+    // Jets are almost transparent; opacity only prevents unlimited overdraw in
+    // the dense base and helps the nearer jet occlude the counter-jet slightly.
+    float opticalDepth = density * ds * 0.040;
+    float alpha = clamp(1.0 - exp(-opticalDepth), 0.0, 0.18);
+    return vec4(emit, alpha);
+}
+
 vec3 trace(vec3 eye, vec3 dir, float time) {
     vec3 p = eye;
     vec3 v = normalize(dir);
@@ -129,6 +188,11 @@ vec3 trace(vec3 eye, vec3 dir, float time) {
         if (r > ESCAPE) { col += background(v) * transmittance; return col; }
 
         float dt = clamp(r * 0.09, 0.012, 0.5);
+        vec4 js = jetSample(p, eye, time, dt);
+        col += js.rgb * transmittance;
+        transmittance *= 1.0 - js.a;
+        if (transmittance < 0.02) return col;
+
         vec3 acc = p * (-1.5 * h2 / pow(r, 5.0));
         vec3 prev = p;
         v += acc * dt;
